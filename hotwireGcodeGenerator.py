@@ -65,11 +65,15 @@ def slicePath(path, step):
 
 #gets the parameters needed for putting an arrow at a specific point of a pointcloud in matplotlib
 def getArrowAtPoint(pointCloud, point, length):
-    index = np.where(np.all(pointCloud==point,axis=1))[0]
-    x = pointCloud[index][0][0]
-    y = pointCloud[index][0][1]
-    dx = pointCloud[index+1][0][0]-pointCloud[index][0][0]
-    dy = pointCloud[index+1][0][1]-pointCloud[index][0][1]
+    index = np.where(np.all(pointCloud==point,axis=1))[0][0]
+    
+    incIndex = index + 1
+    if (incIndex > len(pointCloud) - 1): #wrap around
+        incIndex = 0
+    x = pointCloud[index][0]
+    y = pointCloud[index][1]
+    dx = pointCloud[incIndex][0]-pointCloud[index][0]
+    dy = pointCloud[incIndex][1]-pointCloud[index][1]
     dlength = sqrt(dx**2 + dy**2)
     
     dx = dx * length/dlength
@@ -122,7 +126,8 @@ def interpolate(pointCloud, index) :
         y = (pointCloud[cIndex, 1] + pointCloud[fIndex, 1]) / 2
     
     return np.array([x,y])
-    
+
+#interpolates the point clouds along the longer axis for each segment between two anchor points
 def interpolateBetweenAnchors(xyPath, xyPointCloud, xyAnchorPoint1, xyAnchorPoint2, uvPath, uvPointCloud, uvAnchorPoint1, uvAnchorPoint2, step):
     
     def getAnchorIndex(pointCloud, anchor):
@@ -195,7 +200,8 @@ def slicePathAnchorPoints(xyPath, xyAnchorPoints, uvPath, uvAnchorPoints, step) 
     slicedUV = np.append(slicedUV, appendUV, axis = 0)
     
     return (slicedXY, slicedUV)
-    
+
+#convert the pointsclouds slicedXY and slicedUV into gcode with a feedrate
 def translateToGcode(slicedXY, slicedUV, feedrate):
     gcode = ""
     gcode += "G28\n" #home
@@ -229,7 +235,8 @@ def extractSvg(svgToParse, displayStep = 0.5):
             
         return (pointCloud, anchorPoints, path)
     return "NO APPROPRIATE SVG PROVIDED"
-    
+
+#sort path in a way that connects all elements/subpaths in a closed figure
 def mergePath(path):
     sortedPath = Path()
     sortedPath.append(path.pop(0)[0])
@@ -252,14 +259,41 @@ def mergePath(path):
     
     return sortedPath
     
+#find the closest point to startPoint in pointCloud
 def findClosestPoint(startPoint, pointCloud):
     closestDistance = -1 # set closest distance negative to indicate it hasnt been set
-    for point in pointCloud:
+    index = -1 # same with the index of the point
+    for i, point in enumerate(pointCloud):
         distance = sqrt((point[0] - startPoint[0])**2 + (point[1] - startPoint[1])**2)
         if (distance < closestDistance) or (closestDistance < 0) :
             closestPoint = point
+            index = i
             closestDistance = distance
-    return closestPoint
+        
+    return closestPoint, index
+    
+#calculate actual points for the machine's axes considering a gantry length and placement of the foam in it
+def calcToolPointClouds(xyPointCloud, uvPointCloud, gantryLength, foamWidth, distanceToXYaxis):
+    xyToolPointCloud = np.empty((0,2), float)
+    uvToolPointCloud = np.empty((0,2), float)
+    for i in range(len(xyPointCloud)):
+        #extract coordinates
+        x = xyPointCloud[i][0]
+        y = xyPointCloud[i][1]
+        u = uvPointCloud[i][0]
+        v = uvPointCloud[i][1]
+        
+        #calculate the coordinates on the tool axes (usage of similar triangles)
+        xt = x - (u-x) * distanceToXYaxis / foamWidth
+        ut = xt + (u-x) * gantryLength / foamWidth
+        yt = y - (v-y) * distanceToXYaxis / foamWidth
+        vt = yt + (v-y) * gantryLength / foamWidth
+        
+        #append to point cloud
+        xyToolPointCloud = np.append(xyToolPointCloud, [[xt, yt]], axis = 0)
+        uvToolPointCloud = np.append(uvToolPointCloud, [[ut, vt]], axis = 0)
+    
+    return (xyToolPointCloud, uvToolPointCloud)
 
 class gcodeGeneratorApp(tk.Tk):
 
@@ -382,7 +416,7 @@ class AnchorPointWidget(tk.Frame):
             clickPoint = np.array([event.xdata, event.ydata])
             
             if (self.clickMode == "XY"):
-                closestPoint = findClosestPoint(clickPoint, self.xyAnchorPoints)
+                (closestPoint,index) = findClosestPoint(clickPoint, self.xyAnchorPoints)
                 if not any(np.equal(self.selectedXYAnchorPoints,[closestPoint]).all(1)) :
                     self.selectedXYAnchorPoints = np.append(self.selectedXYAnchorPoints, [closestPoint], axis = 0)
                 else:
@@ -390,7 +424,7 @@ class AnchorPointWidget(tk.Frame):
                     self.selectedXYAnchorPoints = np.delete(self.selectedXYAnchorPoints, index, axis = 0)
                 self.updateDisplay()
             elif (self.clickMode == "UV") :
-                closestPoint = findClosestPoint(clickPoint, self.uvAnchorPoints)
+                (closestPoint,index) = findClosestPoint(clickPoint, self.uvAnchorPoints)
                 if not any(np.equal(self.selectedUVAnchorPoints,[closestPoint]).all(1)) :
                     self.selectedUVAnchorPoints = np.append(self.selectedUVAnchorPoints, [closestPoint], axis = 0)
                 else:
@@ -413,15 +447,30 @@ class AnchorPointWidget(tk.Frame):
         self.updateDisplay()
         
     def updateDisplay(self):
+        #clear
         self.a.clear()
+        #plot point clouds
         self.a.plot(self.xyPointCloud[:,0], self.xyPointCloud[:,1], 'r')
         self.a.plot(self.uvPointCloud[:,0], self.uvPointCloud[:,1], 'g') 
+        #plot anchor points
         self.a.scatter(self.selectedXYAnchorPoints[:,0], self.selectedXYAnchorPoints[:,1], c = 'r')
         for i, point in enumerate(self.selectedXYAnchorPoints):
             self.a.annotate(i+1, point)   
         self.a.scatter(self.selectedUVAnchorPoints[:,0], self.selectedUVAnchorPoints[:,1], c = 'g')
         for i, point in enumerate(self.selectedUVAnchorPoints):
             self.a.annotate(i+1, point)  
+        #plot lines between anchorpoints (only if there has been at np.empty((0,2), float)least one tuple of anchor points selected)
+        if ( (len(self.selectedUVAnchorPoints) > 0) and (len(self.selectedXYAnchorPoints) > 0) ):
+            if ( len(self.selectedXYAnchorPoints) < len(self.selectedUVAnchorPoints) ):
+                minNoSelectedAnchorPoints = len(self.selectedXYAnchorPoints)
+            else:
+                minNoSelectedAnchorPoints = len(self.selectedUVAnchorPoints)
+            for i in range(minNoSelectedAnchorPoints):
+                xCoordinates = [ self.selectedXYAnchorPoints[i][0], self.selectedUVAnchorPoints[i][0] ]
+                yCoordinates = [ self.selectedXYAnchorPoints[i][1], self.selectedUVAnchorPoints[i][1] ]
+                self.a.plot(xCoordinates, yCoordinates, 'grey')
+                
+        #visual settings
         self.a.axis("equal")    
         self.a.grid(color='grey', linestyle='-', linewidth=0.5)
         self.a.legend(["XY", "UV"])  
@@ -434,7 +483,12 @@ class AnchorPointWidget(tk.Frame):
         self.selectedXYAnchorPoints = np.empty((0,2), float)
         self.selectedUVAnchorPoints = np.empty((0,2), float)
         
-        
+class MachineGeometryDisplayWindow(tk.Toplevel):
+    def __init__(self):
+        tk.Toplevel.__init__(self)
+        self.image = tk.PhotoImage(file = "machineGeometry.png").subsample(3,3)
+        self.disp = tk.Label(self, image = self.image)
+        self.disp.pack()
         
 class GenerationWindow(tk.Toplevel):
     def __init__(self, data):
@@ -450,7 +504,7 @@ class GenerationWindow(tk.Toplevel):
         def saveGcode():
             f = open(self.outputfileChooser.getFilePath(), "w")
             feedrate = self.generationWidget.FeedrateSpinbox.get()
-            f.write(translateToGcode(*self.generationWidget.getPoints(), feedrate))
+            f.write(translateToGcode(*self.generationWidget.getToolPoints(), feedrate))
             f.close()
         self.outputfileSaveButton = tk.Button(self.outputFileFrame, text = "save", command = saveGcode)
         self.outputfileSaveButton.pack(side = tk.RIGHT)
@@ -493,6 +547,34 @@ class GenerationWidget(tk.Frame):
         #settings box
         self.settingsFrame = tk.Frame(self)
         self.settingsFrame.pack(side = tk.RIGHT)
+        
+        #gantry length spinbox
+        self.gantryLengthSpinboxLabel = tk.Label(self.settingsFrame, text = "Gantry length:")
+        self.gantryLengthSpinboxLabel.pack()
+        self.gantryLengthSpinbox = tk.Spinbox(self.settingsFrame, from_ = 0, to = 10000, increment=1) # arbitrarily large from/to values for using spinbox as number input
+        self.gantryLengthSpinbox.delete(0, "end")
+        self.gantryLengthSpinbox.insert(0, '1000') #default val
+        self.gantryLengthSpinbox.pack()
+        
+        #foam width spinbox
+        self.foamWidthSpinboxLabel = tk.Label(self.settingsFrame, text = "Foam width:")
+        self.foamWidthSpinboxLabel.pack()
+        self.foamWidthSpinbox = tk.Spinbox(self.settingsFrame, from_ = 0, to = 10000, increment=1) # arbitrarily large from/to values for using spinbox as number input
+        self.foamWidthSpinbox.delete(0, "end")
+        self.foamWidthSpinbox.insert(0, '500') #default val
+        self.foamWidthSpinbox.pack()
+        
+        #distance from foam to xy axes spinbox
+        self.distanceToXYSpinboxLabel = tk.Label(self.settingsFrame, text = "distance Foam - XY axes:")
+        self.distanceToXYSpinboxLabel.pack()
+        self.distanceToXYSpinbox = tk.Spinbox(self.settingsFrame, from_ = 0, to = 10000, increment=1) # arbitrarily large from/to values for using spinbox as number input
+        self.distanceToXYSpinbox.delete(0, "end")
+        self.distanceToXYSpinbox.insert(0, '25') #default val
+        self.distanceToXYSpinbox.pack()
+        
+        #button for showing the machine geometry
+        self.recalcBtn = tk.Button(self.settingsFrame, text = "machine geometry", command = lambda: MachineGeometryDisplayWindow())
+        self.recalcBtn.pack() 
         
         #granularity slider
         self.granularityLabel = tk.Label(self.settingsFrame, text = "granularity [mm] :")
@@ -563,6 +645,7 @@ class GenerationWidget(tk.Frame):
         self.canvas.get_tk_widget().pack(side = tk.LEFT, expand=True)
         
     def calculate(self):
+        #reverse the paths if necessary
         if (self.reverseXY.instate(['selected']) ):
             self.xyUsedPath = self.data[0].reversed()
         else:
@@ -571,17 +654,23 @@ class GenerationWidget(tk.Frame):
             self.uvUsedPath = self.data[3].reversed()
         else:
             self.uvUsedPath = self.data[3]
-        
+        #get the step for slicing from the slider
         step = self.granularitySlider.get()   
-        
+        #slice the path
         (self.xyPoints, self.uvPoints) = slicePathAnchorPoints(self.xyUsedPath, self.data[2], self.uvUsedPath, self.data[5], step)
-        
+        #get anchor point indices
+        self.anchorIndices = []
+        for i in range(len(self.data[2])): #go through all anchor points
+            (point,index) = findClosestPoint(self.data[2][i], self.xyPoints)
+            self.anchorIndices.append(index)
         #add offsets
         self.xyPoints[:,0] += float(self.XSpinbox.get())
         self.xyPoints[:,1] += float(self.YSpinbox.get())
         self.uvPoints[:,0] += float(self.USpinbox.get())
         self.uvPoints[:,1] += float(self.VSpinbox.get())
+        #calculate points for the tools
         
+        (self.xyToolPoints, self.uvToolPoints) = calcToolPointClouds(self.xyPoints, self.uvPoints, float(self.gantryLengthSpinbox.get()) , float(self.foamWidthSpinbox.get()), float(self.distanceToXYSpinbox.get()) )
         
     def updateDisplay(self):
         #recalculate points
@@ -590,25 +679,36 @@ class GenerationWidget(tk.Frame):
         self.a.clear()
         
         #do the plotting here!
-        self.a.scatter(self.xyPoints[:,0], self.xyPoints[:,1], c = 'r')
-        self.a.scatter(self.uvPoints[:,0], self.uvPoints[:,1], c = 'g')
+        self.a.scatter(self.uvToolPoints[:,0], self.uvToolPoints[:,1], c = '#00b500', s = 1) #dark green
+        self.a.scatter(self.uvPoints[:,0], self.uvPoints[:,1], c = '#00ff00', s = 1) #bright green
+        self.a.scatter(self.xyPoints[:,0], self.xyPoints[:,1], c = '#ff0000', s = 1) #bright red, size = 1
+        self.a.scatter(self.xyToolPoints[:,0], self.xyToolPoints[:,1], c = '#b50000', s = 1) #dark red
+        self.a.legend(["UV tool", "UV on foam", "XY on foam", "XY tool"])  
         
         #draw arrow indicating direction
         ylim = self.a.get_ylim()
         xlim = self.a.get_xlim()
         arrowLength = ((ylim[1]-ylim[0]) + (xlim[1]-xlim[0]))/2
         arrowLength = arrowLength / 15
-        #point is added offset
-        self.a.arrow(*getArrowAtPoint(self.xyPoints, self.data[2][0] + np.array([float(self.XSpinbox.get()),float(self.YSpinbox.get())]), arrowLength), head_width = arrowLength / 2.5, color = "#0A0000")
-        self.a.arrow(*getArrowAtPoint(self.uvPoints, self.data[5][0] + np.array([float(self.USpinbox.get()),float(self.VSpinbox.get())]), arrowLength), head_width = arrowLength / 2.5, color = "#000A00")
+        self.a.arrow(*getArrowAtPoint(self.xyToolPoints, self.xyToolPoints[self.anchorIndices[0]], arrowLength), head_width = arrowLength / 2.5, color = "#750000")
+        self.a.arrow(*getArrowAtPoint(self.uvToolPoints, self.uvToolPoints[self.anchorIndices[0]], arrowLength), head_width = arrowLength / 2.5, color = "#007500")
         
+        #draw lines between corresponding anchors/points
+        for anchorIndex in self.anchorIndices :
+            xCoordinates = [ self.xyToolPoints[anchorIndex][0], self.uvToolPoints[anchorIndex][0] ]
+            yCoordinates = [ self.xyToolPoints[anchorIndex][1], self.uvToolPoints[anchorIndex][1] ]
+            self.a.plot(xCoordinates, yCoordinates, 'grey')
+        
+        #visual settings
         self.a.axis("equal")    
         self.a.grid(color='grey', linestyle='-', linewidth=0.5)
-        self.a.legend(["XY", "UV"])  
         self.canvas.draw()
-        
+    
     def getPoints(self):
-        return (self.xyPoints, self.uvPoints)
+        return (self.xyPoints, self.uvPoints) 
+    
+    def getToolPoints(self):
+        return (self.xyToolPoints, self.uvToolPoints)
     
         
 app = gcodeGeneratorApp()
